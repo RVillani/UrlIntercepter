@@ -1,26 +1,25 @@
 // Shows a clicked link in an editable box and opens it in the default browser only when confirmed.
-// Install.cmd compiles this with the C# 5 compiler that ships with Windows (.NET Framework 4),
-// so newer C# syntax (string interpolation, ?., => members, out var) isn't available.
+// Install.cmd compiles this and FluentUI.cs (the reusable UI parts) with the C# 5 compiler that ships
+// with Windows (.NET Framework 4), so newer C# syntax (string interpolation, ?., => members, out var) isn't available.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Text;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
+using FluentUI;
 using Microsoft.Win32;
 
 static class Native
 {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-    [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
-    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] public static extern int SetWindowTheme(IntPtr hwnd, string appName, string idList);
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmdShow);
 
-    public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
     public const int WM_SETREDRAW = 0x000B;
     public const int SW_SHOWNORMAL = 1;
 }
@@ -100,20 +99,24 @@ static class Program
     }
 }
 
-// Resizable dialog with a wrapping text box that fills the space between the label and the buttons
-class LinkDialog : Form
+
+// Resizable dialog with a wrapping text box that fills the space between the label and the button bar
+class LinkDialog : FluentForm
 {
     readonly RichTextBox textBox;
-    readonly Button copy, removeParams, removeAnchor, ok, cancel;
+    readonly SurfacePanel textPanel;
+    readonly ButtonBar buttonBar;
+    readonly IconButton theme, removeParams, removeAnchor, undo, redo, copy, cancel, open;
     readonly Timer copyTimer = new Timer { Interval = 1500 };
     readonly Font monoFont;
-    readonly bool dark;
-    readonly Color letterColor, digitColor, symbolColor, queryColor, ampersandColor, anchorColor;
+    readonly JsonSettings settings = JsonSettings.NextToExecutable();
+    Color letterColor, digitColor, symbolColor, queryColor, ampersandColor, anchorColor;
 
     // Recoloring changes the selection, which must not be recorded as an edit
     bool busy;
     // The built-in undo also undoes each recoloring, so keep our own text history
     readonly List<string> history = new List<string>();
+    readonly List<string> redoHistory = new List<string>();
 
     public string Link
     {
@@ -129,16 +132,16 @@ class LinkDialog : Form
         Font = new Font("Segoe UI", 9);
         Text = "Open link";
         ClientSize = new Size(720, 200);
-        MinimumSize = new Size(600, 180);
+        // The width is raised to fit the button bar in OnLoad
+        MinimumSize = new Size(200, 180);
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
         ShowIcon = false;
         MinimizeBox = false;
 
-        var label = new Label
+        var label = new GlassLabel
         {
             Text = "Review or edit the link:",
-            AutoSize = true,
             Location = new Point(12, 12),
         };
 
@@ -147,73 +150,74 @@ class LinkDialog : Form
         string monoName = new[] { "Cascadia Mono", "Consolas", "Courier New" }.FirstOrDefault(installed.Contains) ?? "Courier New";
         monoFont = new Font(monoName, 10);
 
-        // RichTextBox so letters, digits and symbols can be colored differently
+        // RichTextBox so letters, digits and symbols can be colored differently. It's an ordinary control,
+        // so it sits in the opaque panel rather than on the backdrop.
         textBox = new RichTextBox
         {
             Multiline = true,
             WordWrap = true,
             ScrollBars = RichTextBoxScrollBars.Vertical,
             DetectUrls = false,
+            BorderStyle = BorderStyle.None,
             Font = monoFont,
             Text = url,
+            Dock = DockStyle.Fill,
+        };
+        textPanel = new SurfacePanel
+        {
             Location = new Point(12, 34),
-            Size = new Size(696, 120),
+            Size = new Size(696, 116),
+            Padding = new Padding(8, 6, 2, 6),
             Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
         };
+        textPanel.Controls.Add(textBox);
 
-        // Copies the link without closing the window; the label briefly confirms it
-        copy = new Button
-        {
-            Text = "Copy link",
-            Size = new Size(100, 28),
-            Location = new Point(12, 162),
-            Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
-        };
-        // Deletes the query string (from the ? up to the #), keeping the anchor
-        removeParams = new Button
-        {
-            Text = "Remove parameters",
-            Size = new Size(130, 28),
-            Location = new Point(118, 162),
-            Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
-        };
-        // Deletes the anchor (from the # to the end)
-        removeAnchor = new Button
-        {
-            Text = "Remove anchor",
-            Size = new Size(110, 28),
-            Location = new Point(254, 162),
-            Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
-        };
-        ok = new Button
-        {
-            Text = "OK",
-            DialogResult = DialogResult.OK,
-            Size = new Size(80, 28),
-            Location = new Point(542, 162),
-            Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
-        };
-        cancel = new Button
-        {
-            Text = "Cancel",
-            DialogResult = DialogResult.Cancel,
-            Size = new Size(80, 28),
-            Location = new Point(628, 162),
-            Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
-        };
+        // Icon and tooltip follow the theme mode; see OnThemeChanged
+        theme = new IconButton();
+        removeParams = new IconButton { Icon = Icons.Question, Tone = ButtonTone.Danger, ToolTipText = "Remove parameters (from ? up to #)" };
+        removeAnchor = new IconButton { Icon = Icons.Hash, Tone = ButtonTone.Danger, ToolTipText = "Remove anchor (from #)" };
+        undo = new IconButton { Icon = Icons.Undo, ToolTipText = "Undo (Ctrl+Z)" };
+        redo = new IconButton { Icon = Icons.Redo, ToolTipText = "Redo (Ctrl+Y)" };
+        copy = new IconButton { Icon = Icons.Clipboard, ToolTipText = "Copy link" };
+        cancel = new IconButton { Icon = Icons.Cancel, ToolTipText = "Cancel (Esc)", DialogResult = DialogResult.Cancel };
+        open = new IconButton { Icon = Icons.Globe, ToolTipText = "Open in browser (Enter)", DialogResult = DialogResult.OK };
 
-        Controls.AddRange(new Control[] { label, textBox, copy, removeParams, removeAnchor, ok, cancel });
-        // Enter confirms (see OnTextBoxKeyDown), Esc cancels
-        AcceptButton = ok;
+        buttonBar = new ButtonBar
+        {
+            Location = new Point(12, 158),
+            Size = new Size(696, 32),
+            Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+        };
+        // App settings, link edits and edit history on the left; final actions on the right
+        buttonBar.AddGroup(theme);
+        buttonBar.AddGroup(removeParams, removeAnchor);
+        buttonBar.AddGroup(undo, redo);
+        buttonBar.AddTrailingGroup(copy, cancel, open);
+
+        Controls.AddRange(new Control[] { label, textPanel, buttonBar });
+        // Enter opens (see OnTextBoxKeyDown), Esc cancels
+        AcceptButton = open;
         CancelButton = cancel;
+        SolidContent = textPanel;
         ResumeLayout();
 
-        // Follow Windows' app theme (Settings > Personalization > Colors > app mode)
-        using (RegistryKey personalize = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
-        {
-            dark = personalize != null && Equals(personalize.GetValue("AppsUseLightTheme"), 0);
-        }
-        if (dark)
+        ThemeChanged += OnThemeChanged;
+        ThemeMode = settings.GetEnum("theme", ThemeMode.System);
+
+        copyTimer.Tick += delegate { copyTimer.Stop(); copy.Icon = Icons.Clipboard; copy.ToolTipText = "Copy link"; };
+        theme.Click += OnThemeClick;
+        removeParams.Click += OnRemoveParamsClick;
+        removeAnchor.Click += OnRemoveAnchorClick;
+        undo.Click += delegate { Undo(); textBox.Focus(); };
+        redo.Click += delegate { Redo(); textBox.Focus(); };
+        copy.Click += OnCopyClick;
+        textBox.TextChanged += OnTextBoxTextChanged;
+        textBox.KeyDown += OnTextBoxKeyDown;
+    }
+
+    void OnThemeChanged(object sender, EventArgs e)
+    {
+        if (IsDark)
         {
             letterColor = Color.FromArgb(240, 240, 240);
             digitColor = Color.FromArgb(255, 184, 108);
@@ -221,7 +225,6 @@ class LinkDialog : Form
             queryColor = Color.FromArgb(255, 110, 210);
             ampersandColor = Color.FromArgb(90, 230, 120);
             anchorColor = Color.FromArgb(255, 80, 80);
-            ApplyDarkTheme();
         }
         else
         {
@@ -232,47 +235,20 @@ class LinkDialog : Form
             ampersandColor = Color.FromArgb(0, 135, 60);
             anchorColor = Color.FromArgb(210, 0, 0);
         }
+        textBox.BackColor = Palette.Surface;
+        textBox.ForeColor = Palette.Text;
+        SystemTheme.ApplyToControl(textBox, IsDark);
 
-        copyTimer.Tick += delegate { copyTimer.Stop(); copy.Text = "Copy link"; };
-        copy.Click += OnCopyClick;
-        removeParams.Click += OnRemoveParamsClick;
-        removeAnchor.Click += OnRemoveAnchorClick;
-        textBox.TextChanged += OnTextBoxTextChanged;
-        textBox.KeyDown += OnTextBoxKeyDown;
+        theme.Icon = ThemeMode == ThemeMode.Dark ? Icons.Moon : ThemeMode == ThemeMode.Light ? (IconPainter)Icons.Sun : Icons.Monitor;
+        theme.ToolTipText = "Theme: " + ThemeMode;
+        if (textBox.IsHandleCreated) Recolor();
     }
 
-    void ApplyDarkTheme()
+    protected override void OnLoad(EventArgs e)
     {
-        BackColor = Color.FromArgb(32, 32, 32);
-        ForeColor = Color.FromArgb(240, 240, 240);
-        textBox.BackColor = Color.FromArgb(43, 43, 43);
-        textBox.ForeColor = Color.White;
-        textBox.BorderStyle = BorderStyle.FixedSingle;
-        foreach (Button button in new[] { copy, removeParams, removeAnchor, ok, cancel })
-        {
-            button.FlatStyle = FlatStyle.Flat;
-            button.BackColor = Color.FromArgb(55, 55, 55);
-            button.ForeColor = Color.White;
-            button.FlatAppearance.BorderColor = Color.FromArgb(80, 80, 80);
-            button.FlatAppearance.MouseOverBackColor = Color.FromArgb(70, 70, 70);
-            button.FlatAppearance.MouseDownBackColor = Color.FromArgb(85, 85, 85);
-        }
-        // Highlight the default (Enter) button with the accent-style border
-        ok.FlatAppearance.BorderColor = Color.FromArgb(96, 205, 255);
-
-        // Dark scrollbar; no-op on older Windows
-        textBox.HandleCreated += delegate { Native.SetWindowTheme(textBox.Handle, "DarkMode_Explorer", null); };
-    }
-
-    protected override void OnHandleCreated(EventArgs e)
-    {
-        base.OnHandleCreated(e);
-        // Dark title bar; no-op on older Windows
-        if (dark)
-        {
-            int on = 1;
-            Native.DwmSetWindowAttribute(Handle, Native.DWMWA_USE_IMMERSIVE_DARK_MODE, ref on, 4);
-        }
+        base.OnLoad(e);
+        // Sizes are display-scaled by now; keep every button visible
+        MinimumSize = new Size(buttonBar.MinimumWidth + Width - buttonBar.Width, MinimumSize.Height);
     }
 
     protected override void OnShown(EventArgs e)
@@ -326,9 +302,11 @@ class LinkDialog : Form
         textBox.Invalidate();
         busy = false;
 
-        // Recolor runs after every text change, so keep the button state in sync here
+        // Recolor runs after every text change, so keep the button states in sync here
         removeParams.Enabled = QueryStart(textBox.Text) >= 0;
         removeAnchor.Enabled = textBox.Text.Contains("#");
+        undo.Enabled = history.Count > 1;
+        redo.Enabled = redoHistory.Count > 0;
     }
 
     // A ? only starts the query when it comes before the anchor's #
@@ -341,8 +319,10 @@ class LinkDialog : Form
 
     void OnTextBoxTextChanged(object sender, EventArgs e)
     {
-        if (busy) return;
+        // Color changes (e.g. switching theme) also raise TextChanged
+        if (busy || (history.Count > 0 && history[history.Count - 1] == textBox.Text)) return;
         history.Add(textBox.Text);
+        redoHistory.Clear();
         Recolor();
     }
 
@@ -350,32 +330,66 @@ class LinkDialog : Form
     {
         if (e.KeyCode == Keys.Enter)
         {
-            // A RichTextBox takes Enter as a newline; make it confirm like OK instead
+            // A RichTextBox takes Enter as a newline; make it confirm like Open instead
             e.SuppressKeyPress = true;
-            ok.PerformClick();
+            open.PerformClick();
         }
-        else if (e.Control && e.KeyCode == Keys.Z)
+        else if (e.Control && e.KeyCode == Keys.Z && !e.Shift)
         {
             e.SuppressKeyPress = true;
-            if (history.Count > 1)
-            {
-                history.RemoveAt(history.Count - 1);
-                busy = true;
-                textBox.Text = history[history.Count - 1];
-                busy = false;
-                Recolor();
-                textBox.Select(textBox.TextLength, 0);
-            }
+            Undo();
+        }
+        else if (e.Control && (e.KeyCode == Keys.Y || (e.KeyCode == Keys.Z && e.Shift)))
+        {
+            e.SuppressKeyPress = true;
+            Redo();
         }
     }
 
+    void Undo()
+    {
+        if (history.Count < 2) return;
+        redoHistory.Add(history[history.Count - 1]);
+        history.RemoveAt(history.Count - 1);
+        ShowHistoryText(history[history.Count - 1]);
+    }
+
+    void Redo()
+    {
+        if (redoHistory.Count == 0) return;
+        string text = redoHistory[redoHistory.Count - 1];
+        redoHistory.RemoveAt(redoHistory.Count - 1);
+        history.Add(text);
+        ShowHistoryText(text);
+    }
+
+    // Sets the text without recording it as a new edit
+    void ShowHistoryText(string text)
+    {
+        busy = true;
+        textBox.Text = text;
+        busy = false;
+        Recolor();
+        textBox.Select(textBox.TextLength, 0);
+    }
+
+    // Cycles System -> Light -> Dark and remembers the choice
+    void OnThemeClick(object sender, EventArgs e)
+    {
+        ThemeMode = (ThemeMode)(((int)ThemeMode + 1) % 3);
+        settings.Set("theme", ThemeMode);
+        textBox.Focus();
+    }
+
+    // Copies the link without closing the window; the icon briefly turns into a check mark
     void OnCopyClick(object sender, EventArgs e)
     {
         string link = Link;
         if (link.Length > 0)
         {
             Clipboard.SetText(link);
-            copy.Text = "Copied!";
+            copy.Icon = Icons.Check;
+            copy.ToolTipText = "Copied!";
             copyTimer.Stop();
             copyTimer.Start();
         }

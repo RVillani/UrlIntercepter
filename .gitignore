@@ -1,5 +1,8 @@
 # Built by Install.cmd
 *.exe
 
+# Theme setting, saved next to the exe
+UrlIntercepter.json
+
 # Superseded design notes (see CLAUDE.md)
 Claude outputs/

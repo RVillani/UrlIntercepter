@@ -1,11 +1,12 @@
 @echo off
 rem Builds UrlIntercepter.exe from this folder and registers it as a link handler (current user only, no admin).
-rem Run it again after editing UrlIntercepter.cs or moving the folder.
+rem Run it again after editing the .cs files or moving the folder.
 
 set "SOURCE=%~dp0UrlIntercepter.cs"
+set "UI=%~dp0FluentUI.cs"
 set "EXE=%~dp0UrlIntercepter.exe"
-if not exist "%SOURCE%" (
-    echo UrlIntercepter.cs not found next to this file.
+for %%F in ("%SOURCE%" "%UI%") do if not exist %%F (
+    echo %%~nxF not found next to this file.
     pause
     exit /b 1
 )
@@ -19,7 +20,7 @@ if not exist "%CSC%" (
     exit /b 1
 )
 
-"%CSC%" /nologo /target:winexe /optimize+ /out:"%EXE%" /r:System.Windows.Forms.dll /r:System.Drawing.dll "%SOURCE%"
+"%CSC%" /nologo /target:winexe /optimize+ /out:"%EXE%" /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "%SOURCE%" "%UI%"
 if errorlevel 1 (
     echo.
     echo Build failed. If a link window is open, close it and try again.
