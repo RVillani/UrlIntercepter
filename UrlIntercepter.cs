@@ -104,11 +104,11 @@ static class Program
 class LinkDialog : Form
 {
     readonly RichTextBox textBox;
-    readonly Button copy, removeParams, ok, cancel;
+    readonly Button copy, removeParams, removeAnchor, ok, cancel;
     readonly Timer copyTimer = new Timer { Interval = 1500 };
     readonly Font monoFont;
     readonly bool dark;
-    readonly Color letterColor, digitColor, symbolColor, queryColor, ampersandColor;
+    readonly Color letterColor, digitColor, symbolColor, queryColor, ampersandColor, anchorColor;
 
     // Recoloring changes the selection, which must not be recorded as an edit
     bool busy;
@@ -129,7 +129,7 @@ class LinkDialog : Form
         Font = new Font("Segoe UI", 9);
         Text = "Open link";
         ClientSize = new Size(720, 200);
-        MinimumSize = new Size(440, 180);
+        MinimumSize = new Size(600, 180);
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
         ShowIcon = false;
@@ -169,12 +169,20 @@ class LinkDialog : Form
             Location = new Point(12, 162),
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
         };
-        // Deletes the query string and everything after it (from the ?)
+        // Deletes the query string (from the ? up to the #), keeping the anchor
         removeParams = new Button
         {
             Text = "Remove parameters",
             Size = new Size(130, 28),
             Location = new Point(118, 162),
+            Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
+        };
+        // Deletes the anchor (from the # to the end)
+        removeAnchor = new Button
+        {
+            Text = "Remove anchor",
+            Size = new Size(110, 28),
+            Location = new Point(254, 162),
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left,
         };
         ok = new Button
@@ -194,7 +202,7 @@ class LinkDialog : Form
             Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
         };
 
-        Controls.AddRange(new Control[] { label, textBox, copy, removeParams, ok, cancel });
+        Controls.AddRange(new Control[] { label, textBox, copy, removeParams, removeAnchor, ok, cancel });
         // Enter confirms (see OnTextBoxKeyDown), Esc cancels
         AcceptButton = ok;
         CancelButton = cancel;
@@ -212,6 +220,7 @@ class LinkDialog : Form
             symbolColor = Color.FromArgb(110, 180, 255);
             queryColor = Color.FromArgb(255, 110, 210);
             ampersandColor = Color.FromArgb(90, 230, 120);
+            anchorColor = Color.FromArgb(255, 80, 80);
             ApplyDarkTheme();
         }
         else
@@ -221,11 +230,13 @@ class LinkDialog : Form
             symbolColor = Color.FromArgb(0, 92, 197);
             queryColor = Color.FromArgb(200, 0, 160);
             ampersandColor = Color.FromArgb(0, 135, 60);
+            anchorColor = Color.FromArgb(210, 0, 0);
         }
 
         copyTimer.Tick += delegate { copyTimer.Stop(); copy.Text = "Copy link"; };
         copy.Click += OnCopyClick;
         removeParams.Click += OnRemoveParamsClick;
+        removeAnchor.Click += OnRemoveAnchorClick;
         textBox.TextChanged += OnTextBoxTextChanged;
         textBox.KeyDown += OnTextBoxKeyDown;
     }
@@ -237,7 +248,7 @@ class LinkDialog : Form
         textBox.BackColor = Color.FromArgb(43, 43, 43);
         textBox.ForeColor = Color.White;
         textBox.BorderStyle = BorderStyle.FixedSingle;
-        foreach (Button button in new[] { copy, removeParams, ok, cancel })
+        foreach (Button button in new[] { copy, removeParams, removeAnchor, ok, cancel })
         {
             button.FlatStyle = FlatStyle.Flat;
             button.BackColor = Color.FromArgb(55, 55, 55);
@@ -302,11 +313,12 @@ class LinkDialog : Form
             textBox.Select(m.Index, m.Length);
             textBox.SelectionColor = symbolColor;
         }
-        // ? starts the query and & separates parameters; their own colors make parameters easy to spot
-        foreach (Match m in Regex.Matches(textBox.Text, "[?&]"))
+        // ? starts the query, & separates parameters and # starts the anchor; their own colors
+        // make each part easy to spot
+        foreach (Match m in Regex.Matches(textBox.Text, "[?&#]"))
         {
             textBox.Select(m.Index, m.Length);
-            textBox.SelectionColor = m.Value == "?" ? queryColor : ampersandColor;
+            textBox.SelectionColor = m.Value == "?" ? queryColor : m.Value == "&" ? ampersandColor : anchorColor;
         }
 
         textBox.Select(start, length);
@@ -315,7 +327,16 @@ class LinkDialog : Form
         busy = false;
 
         // Recolor runs after every text change, so keep the button state in sync here
-        removeParams.Enabled = textBox.Text.Contains("?");
+        removeParams.Enabled = QueryStart(textBox.Text) >= 0;
+        removeAnchor.Enabled = textBox.Text.Contains("#");
+    }
+
+    // A ? only starts the query when it comes before the anchor's #
+    static int QueryStart(string text)
+    {
+        int index = text.IndexOf('?');
+        int hash = text.IndexOf('#');
+        return hash >= 0 && index > hash ? -1 : index;
     }
 
     void OnTextBoxTextChanged(object sender, EventArgs e)
@@ -363,10 +384,24 @@ class LinkDialog : Form
 
     void OnRemoveParamsClick(object sender, EventArgs e)
     {
-        int index = textBox.Text.IndexOf('?');
+        string text = textBox.Text;
+        int index = QueryStart(text);
         if (index >= 0)
         {
-            // Goes through TextChanged, so it's recolored and Ctrl+Z restores the parameters
+            // Stop at the #, keeping the anchor. Goes through TextChanged, so it's recolored
+            // and Ctrl+Z restores the parameters
+            int hash = text.IndexOf('#');
+            textBox.Text = text.Substring(0, index) + (hash >= 0 ? text.Substring(hash) : "");
+        }
+        textBox.Focus();
+        textBox.Select(textBox.TextLength, 0);
+    }
+
+    void OnRemoveAnchorClick(object sender, EventArgs e)
+    {
+        int index = textBox.Text.IndexOf('#');
+        if (index >= 0)
+        {
             textBox.Text = textBox.Text.Substring(0, index);
         }
         textBox.Focus();

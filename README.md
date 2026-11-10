@@ -7,8 +7,9 @@ Clicking a link in another app (Discord, email, a PDF…) normally loads the pag
 ## Features
 
 - Editable link box with a monospaced font and colors for letters, digits and symbols, so look-alike characters are easy to tell apart
-- `?` and `&` get their own colors, so query parameters stand out
-- **Remove parameters** button deletes everything from the `?`
+- `?`, `&` and `#` get their own colors, so query parameters and the anchor stand out
+- **Remove parameters** button deletes the query string, from the `?` up to the `#` (the anchor is kept)
+- **Remove anchor** button deletes everything from the `#`
 - **Copy link** button
 - Enter opens the link, Esc cancels, Ctrl+Z undoes edits
 - Follows the Windows dark/light app theme and display scaling, and the window is resizable
