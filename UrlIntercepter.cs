@@ -106,7 +106,7 @@ class LinkDialog : FluentForm
     readonly RichTextBox textBox;
     readonly SurfacePanel textPanel;
     readonly ButtonBar buttonBar;
-    readonly IconButton theme, removeParams, removeAnchor, undo, redo, copy, cancel, open;
+    readonly IconButton theme, backdropButton, removeParams, removeAnchor, undo, redo, copy, cancel, open;
     readonly Timer copyTimer = new Timer { Interval = 1500 };
     readonly Font monoFont;
     readonly JsonSettings settings = JsonSettings.NextToExecutable();
@@ -117,6 +117,8 @@ class LinkDialog : FluentForm
     // The built-in undo also undoes each recoloring, so keep our own text history
     readonly List<string> history = new List<string>();
     readonly List<string> redoHistory = new List<string>();
+    // When the backdrop flyout last closed; see OnBackdropClick
+    int flyoutClosedAt;
 
     public string Link
     {
@@ -174,6 +176,7 @@ class LinkDialog : FluentForm
 
         // Icon and tooltip follow the theme mode; see OnThemeChanged
         theme = new IconButton();
+        backdropButton = new IconButton { Icon = Icons.ArtistPalette, ToolTipText = "Backdrop tint and opacity" };
         removeParams = new IconButton { Icon = Icons.Question, Tone = ButtonTone.Danger, ToolTipText = "Remove parameters (from ? up to #)" };
         removeAnchor = new IconButton { Icon = Icons.Hash, Tone = ButtonTone.Danger, ToolTipText = "Remove anchor (from #)" };
         undo = new IconButton { Icon = Icons.Undo, ToolTipText = "Undo (Ctrl+Z)" };
@@ -189,7 +192,7 @@ class LinkDialog : FluentForm
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
         };
         // App settings, link edits and edit history on the left; final actions on the right
-        buttonBar.AddGroup(theme);
+        buttonBar.AddGroup(theme, backdropButton);
         buttonBar.AddGroup(removeParams, removeAnchor);
         buttonBar.AddGroup(undo, redo);
         buttonBar.AddTrailingGroup(copy, cancel, open);
@@ -201,11 +204,14 @@ class LinkDialog : FluentForm
         SolidContent = textPanel;
         ResumeLayout();
 
+        LoadTint(Palette.Light, "light");
+        LoadTint(Palette.Dark, "dark");
         ThemeChanged += OnThemeChanged;
         ThemeMode = settings.GetEnum("theme", ThemeMode.System);
 
         copyTimer.Tick += delegate { copyTimer.Stop(); copy.Icon = Icons.Clipboard; copy.ToolTipText = "Copy link"; };
         theme.Click += OnThemeClick;
+        backdropButton.Click += OnBackdropClick;
         removeParams.Click += OnRemoveParamsClick;
         removeAnchor.Click += OnRemoveAnchorClick;
         undo.Click += delegate { Undo(); textBox.Focus(); };
@@ -379,6 +385,37 @@ class LinkDialog : FluentForm
         ThemeMode = (ThemeMode)(((int)ThemeMode + 1) % 3);
         settings.Set("theme", ThemeMode);
         textBox.Focus();
+    }
+
+    // Opens the tint and opacity settings for the current theme; they preview live and are saved on close
+    void OnBackdropClick(object sender, EventArgs e)
+    {
+        // Clicking this button while the flyout is open first closes the flyout (it loses focus);
+        // don't reopen it right away
+        if (unchecked(Environment.TickCount - flyoutClosedAt) < 300) return;
+        var flyout = new BackdropFlyout(this);
+        flyout.FormClosed += delegate
+        {
+            flyoutClosedAt = Environment.TickCount;
+            SaveTint(Palette.Light, "light");
+            SaveTint(Palette.Dark, "dark");
+        };
+        flyout.ShowNear(backdropButton);
+    }
+
+    // Stored per theme as e.g. "darkTint": "#202020" and "darkTintOpacity": 30 (percent)
+    void LoadTint(Palette palette, string theme)
+    {
+        Color color;
+        if (ColorPicker.TryParseHex(settings.GetString(theme + "Tint", null), out color))
+            palette.BackdropTint = Color.FromArgb(palette.BackdropTint.A, color);
+        palette.TintOpacity = settings.GetInt(theme + "TintOpacity", palette.TintOpacity);
+    }
+
+    void SaveTint(Palette palette, string theme)
+    {
+        settings.Set(theme + "Tint", ColorPicker.ToHex(palette.BackdropTint));
+        settings.Set(theme + "TintOpacity", palette.TintOpacity);
     }
 
     // Copies the link without closing the window; the icon briefly turns into a check mark

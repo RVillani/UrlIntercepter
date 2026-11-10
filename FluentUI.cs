@@ -10,6 +10,11 @@
 //     excluded from the backdrop and drawn opaque.
 //   - Everywhere else, use GlassControl subclasses (GlassLabel, IconButton, ButtonBar), which draw with alpha.
 // On Windows versions without system backdrops, everything falls back to a solid themed background.
+// The system backdrop can't be tinted, so the form and its GlassControls paint Palette.BackdropTint (a
+// translucent color) over it instead; the title bar, drawn by Windows, stays untinted.
+//
+// Controls with text input (TextField, NumberBox, SliderField, ColorPicker) contain TextBoxes, so they
+// belong on opaque forms such as a Flyout.
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -44,6 +49,14 @@ namespace FluentUI
         public Color Accent;       // focused SurfacePanel underline, accent-colored icons
         public Color Danger;       // icon color of ButtonTone.Danger buttons; their hover fill is a faint version of it
         public Color Separator;    // lines between ButtonBar groups
+        public Color BackdropTint; // painted over the backdrop; its alpha is the tint's opacity (0 = none)
+
+        // BackdropTint's opacity as a percentage
+        public int TintOpacity
+        {
+            get { return (int)Math.Round(BackdropTint.A * 100 / 255.0); }
+            set { BackdropTint = Color.FromArgb((int)Math.Round(Math.Max(0, Math.Min(100, value)) * 255 / 100.0), BackdropTint); }
+        }
 
         public static readonly Palette Light = new Palette
         {
@@ -56,6 +69,7 @@ namespace FluentUI
             Accent = Color.FromArgb(0, 95, 184),
             Danger = Color.FromArgb(196, 43, 28),
             Separator = Color.FromArgb(40, 0, 0, 0),
+            BackdropTint = Color.FromArgb(0, 243, 243, 243),
         };
 
         public static readonly Palette Dark = new Palette
@@ -69,6 +83,7 @@ namespace FluentUI
             Accent = Color.FromArgb(96, 205, 255),
             Danger = Color.FromArgb(255, 120, 130),
             Separator = Color.FromArgb(45, 255, 255, 255),
+            BackdropTint = Color.FromArgb(0, 32, 32, 32),
         };
     }
 
@@ -107,8 +122,57 @@ namespace FluentUI
         }
     }
 
+    // Controls that restyle themselves when their FluentForm applies a theme
+    public interface IThemeAware
+    {
+        void ApplyTheme(FluentForm form);
+    }
+
+    // Sizes for form layouts, derived from the font so they follow display scaling
+    public static class Metrics
+    {
+        public static int Row(Font font) { return font.Height * 2; }
+        public static int FieldHeight(Font font) { return font.Height * 7 / 4; }
+        public static int LabelColumn(Font font) { return font.Height * 3 / 2; }
+        public static int NumberColumn(Font font) { return font.Height * 9 / 2; }
+        public static int Gap(Font font) { return font.Height / 2; }
+    }
+
+    // Paints with GDI+ into a 32-bit bitmap and copies it to the window with its alpha channel, which
+    // ordinary WinForms drawing drops
+    public static class AlphaPaint
+    {
+        public static void Paint(Graphics target, Size size, Color background, Action<Graphics> draw)
+        {
+            if (size.Width <= 0 || size.Height <= 0) return;
+            using (var bitmap = new Bitmap(size.Width, size.Height, PixelFormat.Format32bppPArgb))
+            {
+                using (Graphics g = Graphics.FromImage(bitmap))
+                {
+                    g.Clear(background);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    // ClearType needs an opaque background to blend with
+                    g.TextRenderingHint = background.A == 255 ? TextRenderingHint.ClearTypeGridFit : TextRenderingHint.AntiAliasGridFit;
+                    if (draw != null) draw(g);
+                }
+                // GetHbitmap with a transparent background color keeps the (premultiplied) alpha
+                IntPtr hdc = target.GetHdc();
+                IntPtr hBitmap = bitmap.GetHbitmap(Color.FromArgb(0));
+                IntPtr memDC = NativeMethods.CreateCompatibleDC(hdc);
+                IntPtr old = NativeMethods.SelectObject(memDC, hBitmap);
+                NativeMethods.BitBlt(hdc, 0, 0, size.Width, size.Height, memDC, 0, 0, NativeMethods.SRCCOPY);
+                NativeMethods.SelectObject(memDC, old);
+                NativeMethods.DeleteDC(memDC);
+                NativeMethods.DeleteObject(hBitmap);
+                target.ReleaseHdc(hdc);
+            }
+        }
+    }
+
     // Form with a system backdrop, a dark/light title bar and a theme that can follow Windows.
     // ThemeChanged fires whenever the theme is (re)applied, so ordinary controls can be recolored.
+    // After changing Palette.BackdropTint, call Invalidate(true) to repaint.
     public class FluentForm : Form
     {
         ThemeMode themeMode = ThemeMode.System;
@@ -132,6 +196,12 @@ namespace FluentUI
         public Palette Palette
         {
             get { return IsDark ? Palette.Dark : Palette.Light; }
+        }
+
+        // What the form and its GlassControls fill their background with
+        public Color GlassFill
+        {
+            get { return BackdropActive ? Palette.BackdropTint : Palette.Background; }
         }
 
         // Shared by the form's controls (IconButton.ToolTipText uses it)
@@ -185,6 +255,12 @@ namespace FluentUI
             UpdateFrame();
         }
 
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            if (BackdropActive) AlphaPaint.Paint(e.Graphics, ClientSize, GlassFill, null);
+            else base.OnPaintBackground(e);
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing) toolTip.Dispose();
@@ -212,8 +288,19 @@ namespace FluentUI
             }
             // GDI's black has zero alpha, so it's fully transparent over the backdrop
             BackColor = BackdropActive ? Color.Black : Palette.Background;
+            ApplyThemeTo(Controls);
             Invalidate(true);
             if (ThemeChanged != null) ThemeChanged(this, EventArgs.Empty);
+        }
+
+        void ApplyThemeTo(Control.ControlCollection controls)
+        {
+            foreach (Control control in controls)
+            {
+                var aware = control as IThemeAware;
+                if (aware != null) aware.ApplyTheme(this);
+                ApplyThemeTo(control.Controls);
+            }
         }
 
         void UpdateFrame()
@@ -283,7 +370,7 @@ namespace FluentUI
     }
 
     // Base for controls drawn on the backdrop: paints into a 32-bit bitmap with GDI+ and copies it to the
-    // window with its alpha channel intact. Subclasses draw in PaintContent.
+    // window with its alpha channel intact. Subclasses draw in PaintContent and lay out children in OnLayout.
     public abstract class GlassControl : Control
     {
         protected GlassControl()
@@ -303,39 +390,20 @@ namespace FluentUI
             get { FluentForm form = FluentForm; return form != null ? form.Palette : Palette.Light; }
         }
 
-        protected bool BackdropActive
-        {
-            get { FluentForm form = FluentForm; return form != null && form.BackdropActive; }
-        }
-
         protected abstract void PaintContent(Graphics g);
+
+        // Display scaling moves and resizes children after the constructor laid them out, so lay out again
+        // once the window exists
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            PerformLayout();
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            if (Width <= 0 || Height <= 0) return;
-            bool backdrop = BackdropActive;
-            using (var bitmap = new Bitmap(Width, Height, PixelFormat.Format32bppPArgb))
-            {
-                using (Graphics g = Graphics.FromImage(bitmap))
-                {
-                    g.Clear(backdrop ? Color.Transparent : BackColor);
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                    // ClearType needs an opaque background to blend with
-                    g.TextRenderingHint = backdrop ? TextRenderingHint.AntiAliasGridFit : TextRenderingHint.ClearTypeGridFit;
-                    PaintContent(g);
-                }
-                // GetHbitmap with a transparent background color keeps the (premultiplied) alpha
-                IntPtr hdc = e.Graphics.GetHdc();
-                IntPtr hBitmap = bitmap.GetHbitmap(Color.FromArgb(0));
-                IntPtr memDC = NativeMethods.CreateCompatibleDC(hdc);
-                IntPtr old = NativeMethods.SelectObject(memDC, hBitmap);
-                NativeMethods.BitBlt(hdc, 0, 0, Width, Height, memDC, 0, 0, NativeMethods.SRCCOPY);
-                NativeMethods.SelectObject(memDC, old);
-                NativeMethods.DeleteDC(memDC);
-                NativeMethods.DeleteObject(hBitmap);
-                e.Graphics.ReleaseHdc(hdc);
-            }
+            FluentForm form = FluentForm;
+            AlphaPaint.Paint(e.Graphics, Size, form != null ? form.GlassFill : BackColor, PaintContent);
         }
     }
 
@@ -624,13 +692,6 @@ namespace FluentUI
             return width;
         }
 
-        // Display scaling moves the buttons after the bar laid them out, so lay out again once the window exists
-        protected override void OnHandleCreated(EventArgs e)
-        {
-            base.OnHandleCreated(e);
-            PerformLayout();
-        }
-
         protected override void OnLayout(LayoutEventArgs e)
         {
             base.OnLayout(e);
@@ -708,6 +769,33 @@ namespace FluentUI
             {
                 g.FillPath(brush, clip);
                 g.DrawPath(pen, clip);
+            }
+        }
+
+        // Artist's palette with dabs of paint
+        public static void ArtistPalette(Graphics g, Palette palette, Color tint)
+        {
+            // The thumb hole is cut out by the alternate fill mode
+            using (var board = new GraphicsPath(FillMode.Alternate))
+            using (var brush = new LinearGradientBrush(new RectangleF(2, 3.5f, 20, 17), Color.FromArgb(244, 218, 172), Color.FromArgb(206, 160, 100), 45f))
+            using (var pen = new Pen(Color.FromArgb(170, 120, 65), 0.8f))
+            {
+                board.AddEllipse(2, 3.5f, 20, 17);
+                board.AddEllipse(13.5f, 13, 4.5f, 4.5f);
+                g.FillPath(brush, board);
+                g.DrawPath(pen, board);
+            }
+            Dab(g, Color.FromArgb(232, 40, 50), 6.5f, 8.5f);
+            Dab(g, Color.FromArgb(255, 190, 0), 11.5f, 6.8f);
+            Dab(g, Color.FromArgb(40, 180, 90), 16.5f, 8.5f);
+            Dab(g, Color.FromArgb(0, 120, 215), 6.8f, 14);
+        }
+
+        static void Dab(Graphics g, Color color, float x, float y)
+        {
+            using (var brush = new SolidBrush(color))
+            {
+                g.FillEllipse(brush, x - 2.1f, y - 2.1f, 4.2f, 4.2f);
             }
         }
 
@@ -915,6 +1003,919 @@ namespace FluentUI
         }
     }
 
+    // Single-line text input: a borderless TextBox in a SurfacePanel, restyled with the theme.
+    // Use Box for the text and its events. Needs an opaque area (see the top of this file).
+    public class TextField : SurfacePanel, IThemeAware
+    {
+        readonly TextBox box = new TextBox { BorderStyle = BorderStyle.None };
+
+        public TextField()
+        {
+            Controls.Add(box);
+        }
+
+        public TextBox Box
+        {
+            get { return box; }
+        }
+
+        public void ApplyTheme(FluentForm form)
+        {
+            box.BackColor = form.Palette.Surface;
+            box.ForeColor = form.Palette.Text;
+            Invalidate();
+        }
+
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            int padding = Font.Height / 3;
+            box.SetBounds(padding, (Height - box.Height) / 2, Math.Max(0, Width - 2 * padding), box.Height);
+        }
+
+        protected override void OnFontChanged(EventArgs e)
+        {
+            base.OnFontChanged(e);
+            PerformLayout();
+        }
+
+        // Clicking the padding around the text focuses it too
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            box.Focus();
+        }
+    }
+
+    // Whole-number input limited to Minimum..Maximum. Typing a valid number applies it right away; anything
+    // else is corrected on Enter or when leaving. Up/Down, Page Up/Down and the mouse wheel step the value.
+    // Setting Value doesn't raise ValueChanged; only user edits do.
+    public class NumberBox : TextField
+    {
+        int minimum, maximum = 100, current;
+        bool showing;
+
+        public event EventHandler ValueChanged;
+
+        public NumberBox()
+        {
+            Box.TextAlign = HorizontalAlignment.Center;
+            Box.Text = "0";
+            Box.KeyPress += OnBoxKeyPress;
+            Box.KeyDown += OnBoxKeyDown;
+            Box.TextChanged += OnBoxTextChanged;
+            Box.Leave += delegate { Commit(); };
+            Box.MouseWheel += delegate(object sender, MouseEventArgs e) { SetValue(current + Math.Sign(e.Delta), true); };
+        }
+
+        public int Minimum
+        {
+            get { return minimum; }
+            set { minimum = value; maximum = Math.Max(maximum, value); SetValue(current, false); }
+        }
+
+        public int Maximum
+        {
+            get { return maximum; }
+            set { maximum = value; minimum = Math.Min(minimum, value); SetValue(current, false); }
+        }
+
+        public int Value
+        {
+            get { return current; }
+            set { SetValue(value, false); }
+        }
+
+        void SetValue(int value, bool raise)
+        {
+            value = Math.Max(minimum, Math.Min(maximum, value));
+            bool changed = value != current;
+            current = value;
+            ShowValue();
+            if (changed && raise && ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+        }
+
+        void ShowValue()
+        {
+            string text = current.ToString();
+            if (Box.Text == text) return;
+            showing = true;
+            Box.Text = text;
+            Box.SelectionStart = text.Length;
+            showing = false;
+        }
+
+        void Commit()
+        {
+            int parsed;
+            if (int.TryParse(Box.Text, out parsed)) SetValue(parsed, true);
+            else ShowValue();
+        }
+
+        void OnBoxTextChanged(object sender, EventArgs e)
+        {
+            int parsed;
+            if (showing || !int.TryParse(Box.Text, out parsed) || parsed < minimum || parsed > maximum || parsed == current) return;
+            current = parsed;
+            if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+        }
+
+        void OnBoxKeyPress(object sender, KeyPressEventArgs e)
+        {
+            bool allowed = char.IsDigit(e.KeyChar) || char.IsControl(e.KeyChar) || (e.KeyChar == '-' && minimum < 0);
+            if (!allowed) e.Handled = true;
+        }
+
+        void OnBoxKeyDown(object sender, KeyEventArgs e)
+        {
+            int step = 0;
+            if (e.KeyCode == Keys.Up) step = 1;
+            else if (e.KeyCode == Keys.Down) step = -1;
+            else if (e.KeyCode == Keys.PageUp) step = 10;
+            else if (e.KeyCode == Keys.PageDown) step = -10;
+            else if (e.KeyCode == Keys.Enter)
+            {
+                // Also stops the error beep
+                e.SuppressKeyPress = true;
+                Commit();
+                return;
+            }
+            if (step == 0) return;
+            e.Handled = true;
+            SetValue(current + step, true);
+        }
+    }
+
+    // Horizontal slider in the Windows 11 style: accent fill up to a round thumb. With TrackColor set, the
+    // track instead shows a color gradient (e.g. a hue rainbow) and the thumb's center shows the picked color.
+    // Setting Value doesn't raise ValueChanged; only user edits do.
+    public class GlassSlider : GlassControl
+    {
+        int minimum, maximum = 100, current;
+        bool hovered, dragging;
+        Func<float, Color> trackColor;
+
+        public event EventHandler ValueChanged;
+
+        public GlassSlider()
+        {
+            SetStyle(ControlStyles.Selectable, true);
+            TabStop = true;
+            Size = new Size(160, 32);
+        }
+
+        public int Minimum
+        {
+            get { return minimum; }
+            set { minimum = value; maximum = Math.Max(maximum, value); SetValue(current, false); Invalidate(); }
+        }
+
+        public int Maximum
+        {
+            get { return maximum; }
+            set { maximum = value; minimum = Math.Min(minimum, value); SetValue(current, false); Invalidate(); }
+        }
+
+        public int Value
+        {
+            get { return current; }
+            set { SetValue(value, false); }
+        }
+
+        // Color at a position along the track, from 0 (left) to 1 (right); null for the accent style
+        public Func<float, Color> TrackColor
+        {
+            get { return trackColor; }
+            set { trackColor = value; Invalidate(); }
+        }
+
+        float ThumbRadius
+        {
+            get { return Height * 0.3f; }
+        }
+
+        float TrackLeft
+        {
+            get { return ThumbRadius + 1; }
+        }
+
+        float TrackRight
+        {
+            get { return Width - ThumbRadius - 1; }
+        }
+
+        void SetValue(int value, bool raise)
+        {
+            value = Math.Max(minimum, Math.Min(maximum, value));
+            if (value == current) return;
+            current = value;
+            Invalidate();
+            if (raise && ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+        }
+
+        int ValueAt(int x)
+        {
+            float length = TrackRight - TrackLeft;
+            float t = length > 0 ? Math.Max(0, Math.Min(1, (x - TrackLeft) / length)) : 0;
+            return minimum + (int)Math.Round(t * (maximum - minimum));
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            Focus();
+            dragging = true;
+            SetValue(ValueAt(e.X), true);
+            Invalidate();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (dragging) SetValue(ValueAt(e.X), true);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            dragging = false;
+            Invalidate();
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            hovered = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            hovered = false;
+            Invalidate();
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            SetValue(current + Math.Sign(e.Delta), true);
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys key = keyData & Keys.KeyCode;
+            return key == Keys.Left || key == Keys.Right || key == Keys.Up || key == Keys.Down || base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            int page = Math.Max(1, (maximum - minimum) / 10);
+            if (e.KeyCode == Keys.Left || e.KeyCode == Keys.Down) SetValue(current - 1, true);
+            else if (e.KeyCode == Keys.Right || e.KeyCode == Keys.Up) SetValue(current + 1, true);
+            else if (e.KeyCode == Keys.PageDown) SetValue(current - page, true);
+            else if (e.KeyCode == Keys.PageUp) SetValue(current + page, true);
+            else if (e.KeyCode == Keys.Home) SetValue(minimum, true);
+            else if (e.KeyCode == Keys.End) SetValue(maximum, true);
+        }
+
+        protected override void OnGotFocus(EventArgs e)
+        {
+            base.OnGotFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnLostFocus(EventArgs e)
+        {
+            base.OnLostFocus(e);
+            Invalidate();
+        }
+
+        protected override void PaintContent(Graphics g)
+        {
+            Palette palette = Palette;
+            float radius = ThumbRadius, left = TrackLeft, right = TrackRight, middle = Height / 2f;
+            float t = maximum > minimum ? (float)(current - minimum) / (maximum - minimum) : 0;
+            float x = left + t * (right - left);
+
+            if (trackColor != null)
+            {
+                float thickness = radius * 1.1f;
+                var track = new RectangleF(left - thickness / 2, middle - thickness / 2, right - left + thickness, thickness);
+                using (GraphicsPath path = Icons.RoundedRect(track, thickness / 2))
+                using (var brush = new LinearGradientBrush(new PointF(left, 0), new PointF(right, 0), Color.Black, Color.White))
+                using (var pen = new Pen(palette.Separator))
+                {
+                    var blend = new ColorBlend(17);
+                    for (int i = 0; i < 17; i++)
+                    {
+                        blend.Positions[i] = i / 16f;
+                        blend.Colors[i] = trackColor(i / 16f);
+                    }
+                    brush.InterpolationColors = blend;
+                    // The rounded ends reach past the gradient; mirror it there instead of repeating it
+                    brush.WrapMode = WrapMode.TileFlipX;
+                    g.FillPath(brush, path);
+                    g.DrawPath(pen, path);
+                }
+            }
+            else
+            {
+                float thickness = Math.Max(2, radius * 0.45f);
+                using (GraphicsPath rest = Icons.RoundedRect(new RectangleF(left, middle - thickness / 2, right - left, thickness), thickness / 2))
+                using (GraphicsPath filled = Icons.RoundedRect(new RectangleF(left, middle - thickness / 2, x - left, thickness), thickness / 2))
+                using (var restBrush = new SolidBrush(Color.FromArgb(115, palette.Text)))
+                using (var fillBrush = new SolidBrush(palette.Accent))
+                {
+                    g.FillPath(restBrush, rest);
+                    g.FillPath(fillBrush, filled);
+                }
+            }
+
+            // Thumb: a surface-colored disc whose center dot grows on hover and shrinks while dragging
+            float dot = radius * (dragging ? 0.45f : hovered ? 0.62f : 0.52f);
+            using (var surface = new SolidBrush(palette.Surface))
+            using (var border = new Pen(palette.Border))
+            using (var center = new SolidBrush(trackColor != null ? trackColor(t) : palette.Accent))
+            {
+                g.FillEllipse(surface, x - radius, middle - radius, 2 * radius, 2 * radius);
+                g.DrawEllipse(border, x - radius, middle - radius, 2 * radius, 2 * radius);
+                g.FillEllipse(center, x - dot, middle - dot, 2 * dot, 2 * dot);
+            }
+            if (Focused && ShowFocusCues)
+            {
+                float ring = radius + 2;
+                using (var pen = new Pen(palette.Text, 1.5f))
+                {
+                    g.DrawEllipse(pen, x - ring, middle - ring, 2 * ring, 2 * ring);
+                }
+            }
+        }
+    }
+
+    // A row with a label (Text), a slider and a number box kept in sync, laid out in the Metrics columns.
+    // Setting Value doesn't raise ValueChanged; only user edits do.
+    public class SliderField : GlassControl
+    {
+        readonly GlassSlider slider = new GlassSlider();
+        readonly NumberBox numberBox = new NumberBox();
+        bool syncing;
+
+        public event EventHandler ValueChanged;
+
+        public SliderField()
+        {
+            SetStyle(ControlStyles.Selectable, false);
+            TabStop = false;
+            Controls.Add(slider);
+            Controls.Add(numberBox);
+            slider.ValueChanged += delegate { Sync(slider.Value); };
+            numberBox.ValueChanged += delegate { Sync(numberBox.Value); };
+        }
+
+        public int Minimum
+        {
+            get { return slider.Minimum; }
+            set { slider.Minimum = value; numberBox.Minimum = value; }
+        }
+
+        public int Maximum
+        {
+            get { return slider.Maximum; }
+            set { slider.Maximum = value; numberBox.Maximum = value; }
+        }
+
+        public int Value
+        {
+            get { return slider.Value; }
+            set { slider.Value = value; numberBox.Value = value; }
+        }
+
+        public Func<float, Color> TrackColor
+        {
+            get { return slider.TrackColor; }
+            set { slider.TrackColor = value; }
+        }
+
+        // Repaints the track after the colors TrackColor returns have changed
+        public void RefreshTrack()
+        {
+            slider.Invalidate();
+        }
+
+        void Sync(int value)
+        {
+            if (syncing) return;
+            syncing = true;
+            slider.Value = value;
+            numberBox.Value = value;
+            syncing = false;
+            if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+        }
+
+        protected override void OnTextChanged(EventArgs e)
+        {
+            base.OnTextChanged(e);
+            Invalidate();
+        }
+
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            int label = Metrics.LabelColumn(Font), number = Metrics.NumberColumn(Font), gap = Metrics.Gap(Font);
+            int field = Math.Min(Height, Metrics.FieldHeight(Font));
+            numberBox.SetBounds(Width - number, (Height - field) / 2, number, field);
+            slider.SetBounds(label, 0, Math.Max(0, Width - label - number - gap), Height);
+        }
+
+        protected override void PaintContent(Graphics g)
+        {
+            using (var brush = new SolidBrush(Palette.Text))
+            using (var format = new StringFormat { LineAlignment = StringAlignment.Center })
+            {
+                g.DrawString(Text, Font, brush, new RectangleF(0, 0, Metrics.LabelColumn(Font), Height), format);
+            }
+        }
+    }
+
+    // Equal-width text tabs; the selected one gets a subtle fill and an accent underline
+    public class TabStrip : GlassControl
+    {
+        string[] items = new string[0];
+        int selectedIndex, hoverIndex = -1;
+
+        public event EventHandler SelectedIndexChanged;
+
+        public TabStrip()
+        {
+            SetStyle(ControlStyles.Selectable, true);
+            TabStop = true;
+        }
+
+        public void SetItems(params string[] names)
+        {
+            items = names;
+            selectedIndex = 0;
+            Invalidate();
+        }
+
+        public int SelectedIndex
+        {
+            get { return selectedIndex; }
+            set
+            {
+                value = Math.Max(0, Math.Min(items.Length - 1, value));
+                if (value == selectedIndex) return;
+                selectedIndex = value;
+                Invalidate();
+                if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
+            }
+        }
+
+        RectangleF TabBounds(int index)
+        {
+            float width = (float)Width / items.Length;
+            return new RectangleF(index * width, 0, width, Height);
+        }
+
+        int IndexAt(Point point)
+        {
+            if (items.Length == 0 || !ClientRectangle.Contains(point)) return -1;
+            return Math.Min(items.Length - 1, point.X * items.Length / Width);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int index = IndexAt(e.Location);
+            if (index != hoverIndex) { hoverIndex = index; Invalidate(); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            hoverIndex = -1;
+            Invalidate();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            int index = IndexAt(e.Location);
+            if (e.Button == MouseButtons.Left && index >= 0) SelectedIndex = index;
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys key = keyData & Keys.KeyCode;
+            return key == Keys.Left || key == Keys.Right || base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode == Keys.Left) SelectedIndex--;
+            else if (e.KeyCode == Keys.Right) SelectedIndex++;
+        }
+
+        protected override void OnGotFocus(EventArgs e)
+        {
+            base.OnGotFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnLostFocus(EventArgs e)
+        {
+            base.OnLostFocus(e);
+            Invalidate();
+        }
+
+        protected override void PaintContent(Graphics g)
+        {
+            Palette palette = Palette;
+            float radius = Height / 8f;
+            using (var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            {
+                for (int i = 0; i < items.Length; i++)
+                {
+                    RectangleF tab = TabBounds(i);
+                    tab.Inflate(-2, -2);
+                    if (i == selectedIndex || i == hoverIndex)
+                    {
+                        using (GraphicsPath path = Icons.RoundedRect(tab, radius))
+                        using (var brush = new SolidBrush(palette.Hover))
+                        {
+                            g.FillPath(brush, path);
+                        }
+                    }
+                    using (var brush = new SolidBrush(i == selectedIndex ? palette.Text : Color.FromArgb(170, palette.Text)))
+                    {
+                        g.DrawString(items[i], Font, brush, tab, format);
+                    }
+                    if (i == selectedIndex)
+                    {
+                        float width = Math.Min(tab.Width / 3, Height * 0.6f), thickness = Math.Max(2, Height / 10f);
+                        var pill = new RectangleF(tab.X + (tab.Width - width) / 2, tab.Bottom - thickness - 1, width, thickness);
+                        using (GraphicsPath path = Icons.RoundedRect(pill, thickness / 2))
+                        using (var brush = new SolidBrush(palette.Accent))
+                        {
+                            g.FillPath(brush, path);
+                        }
+                        if (Focused && ShowFocusCues)
+                        {
+                            using (GraphicsPath path = Icons.RoundedRect(tab, radius))
+                            using (var pen = new Pen(palette.Text, 1.5f))
+                            {
+                                g.DrawPath(pen, path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Color editor: RGB and HSV tabs with a SliderField per channel (each track previews its channel's
+    // colors), a swatch and an editable hex value. Hue and saturation are kept separately from the RGB
+    // color, so they survive passing through grays and black. Size it with PreferredHeight.
+    public class ColorPicker : GlassControl
+    {
+        readonly TabStrip tabs = new TabStrip();
+        readonly SliderField[] channels = { new SliderField(), new SliderField(), new SliderField() };
+        readonly TextField hex = new TextField();
+        Rectangle swatch;
+        Color color = Color.White;
+        double hue, saturation, brightness = 1;
+        bool loading;
+
+        public event EventHandler ColorChanged;
+
+        public ColorPicker()
+        {
+            SetStyle(ControlStyles.Selectable, false);
+            TabStop = false;
+            tabs.SetItems("RGB", "HSV");
+            tabs.SelectedIndexChanged += delegate { LoadChannels(); };
+            Controls.Add(tabs);
+            foreach (SliderField channel in channels)
+            {
+                channel.ValueChanged += OnChannelChanged;
+                Controls.Add(channel);
+            }
+            hex.Box.MaxLength = 7;
+            hex.Box.TextAlign = HorizontalAlignment.Center;
+            hex.Box.TextChanged += OnHexTextChanged;
+            hex.Box.Leave += delegate { ShowHex(); };
+            hex.Box.KeyDown += delegate(object sender, KeyEventArgs e)
+            {
+                if (e.KeyCode != Keys.Enter) return;
+                e.SuppressKeyPress = true;
+                ShowHex();
+            };
+            Controls.Add(hex);
+            LoadChannels();
+            ShowHex();
+        }
+
+        // Always opaque; the alpha channel is ignored
+        public Color Color
+        {
+            get { return color; }
+            set { Apply(value, true, true); }
+        }
+
+        public int PreferredHeight
+        {
+            get { return Metrics.Row(Font) * 5 + Metrics.Gap(Font) * 2; }
+        }
+
+        bool IsHsv
+        {
+            get { return tabs.SelectedIndex == 1; }
+        }
+
+        public static string ToHex(Color color)
+        {
+            return "#" + color.R.ToString("X2") + color.G.ToString("X2") + color.B.ToString("X2");
+        }
+
+        // Accepts #RRGGBB or #RGB, with or without the #
+        public static bool TryParseHex(string text, out Color color)
+        {
+            color = Color.Empty;
+            string digits = (text ?? "").Trim().TrimStart('#');
+            if (digits.Length == 3) digits = new string(new[] { digits[0], digits[0], digits[1], digits[1], digits[2], digits[2] });
+            int value;
+            if (digits.Length != 6 || !int.TryParse(digits, System.Globalization.NumberStyles.HexNumber, null, out value)) return false;
+            color = Color.FromArgb(255, Color.FromArgb(value));
+            return true;
+        }
+
+        public static Color FromHsv(double hue, double saturation, double brightness)
+        {
+            double h = (hue % 360 + 360) % 360 / 60;
+            int sector = (int)Math.Floor(h);
+            double f = h - sector, v = brightness;
+            double p = v * (1 - saturation), q = v * (1 - saturation * f), t = v * (1 - saturation * (1 - f));
+            double r, g, b;
+            switch (sector)
+            {
+                case 0: r = v; g = t; b = p; break;
+                case 1: r = q; g = v; b = p; break;
+                case 2: r = p; g = v; b = t; break;
+                case 3: r = p; g = q; b = v; break;
+                case 4: r = t; g = p; b = v; break;
+                default: r = v; g = p; b = q; break;
+            }
+            return Color.FromArgb(To255(r), To255(g), To255(b));
+        }
+
+        static int To255(double fraction)
+        {
+            return (int)Math.Round(Math.Max(0, Math.Min(1, fraction)) * 255);
+        }
+
+        // Grays keep the current hue, and black keeps the current hue and saturation
+        void UpdateHsv()
+        {
+            double r = color.R / 255.0, g = color.G / 255.0, b = color.B / 255.0;
+            double max = Math.Max(r, Math.Max(g, b)), min = Math.Min(r, Math.Min(g, b)), delta = max - min;
+            brightness = max;
+            if (max > 0) saturation = delta / max;
+            if (delta > 0)
+            {
+                double h = max == r ? (g - b) / delta : max == g ? 2 + (b - r) / delta : 4 + (r - g) / delta;
+                hue = (h * 60 + 360) % 360;
+            }
+        }
+
+        // updateHsv is false when hue/saturation/brightness were just edited and produced this color
+        void Apply(Color value, bool updateHsv, bool showHex)
+        {
+            value = Color.FromArgb(255, value);
+            bool changed = value.ToArgb() != color.ToArgb();
+            color = value;
+            if (updateHsv) UpdateHsv();
+            LoadChannels();
+            if (showHex) ShowHex();
+            Invalidate();
+            if (changed && ColorChanged != null) ColorChanged(this, EventArgs.Empty);
+        }
+
+        void LoadChannels()
+        {
+            loading = true;
+            string[] names = IsHsv ? new[] { "H", "S", "V" } : new[] { "R", "G", "B" };
+            int[] maximums = IsHsv ? new[] { 360, 100, 100 } : new[] { 255, 255, 255 };
+            int[] values = IsHsv
+                ? new[] { (int)Math.Round(hue), (int)Math.Round(saturation * 100), (int)Math.Round(brightness * 100) }
+                : new int[] { color.R, color.G, color.B };
+            for (int i = 0; i < 3; i++)
+            {
+                channels[i].Text = names[i];
+                channels[i].Maximum = maximums[i];
+                channels[i].Value = values[i];
+                channels[i].TrackColor = TrackFor(i);
+                channels[i].RefreshTrack();
+            }
+            loading = false;
+        }
+
+        // The colors each channel's track shows: the current color with that channel swept from 0 to max
+        Func<float, Color> TrackFor(int channel)
+        {
+            if (IsHsv)
+            {
+                if (channel == 0) return t => FromHsv(t * 360, 1, 1);
+                if (channel == 1) return t => FromHsv(hue, t, brightness);
+                return t => FromHsv(hue, saturation, t);
+            }
+            if (channel == 0) return t => Color.FromArgb(To255(t), color.G, color.B);
+            if (channel == 1) return t => Color.FromArgb(color.R, To255(t), color.B);
+            return t => Color.FromArgb(color.R, color.G, To255(t));
+        }
+
+        void OnChannelChanged(object sender, EventArgs e)
+        {
+            if (loading) return;
+            if (IsHsv)
+            {
+                hue = channels[0].Value;
+                saturation = channels[1].Value / 100.0;
+                brightness = channels[2].Value / 100.0;
+                Apply(FromHsv(hue, saturation, brightness), false, true);
+            }
+            else
+            {
+                Apply(Color.FromArgb(channels[0].Value, channels[1].Value, channels[2].Value), true, true);
+            }
+        }
+
+        void OnHexTextChanged(object sender, EventArgs e)
+        {
+            Color parsed;
+            // Applies as soon as the text is a complete color; the text itself is tidied up on Enter or leaving
+            if (!loading && TryParseHex(hex.Box.Text, out parsed)) Apply(parsed, true, false);
+        }
+
+        void ShowHex()
+        {
+            loading = true;
+            hex.Box.Text = ToHex(color);
+            loading = false;
+        }
+
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            int row = Metrics.Row(Font), gap = Metrics.Gap(Font), number = Metrics.NumberColumn(Font), field = Metrics.FieldHeight(Font);
+            tabs.SetBounds(0, 0, Width, row);
+            int y = row + gap;
+            foreach (SliderField channel in channels)
+            {
+                channel.SetBounds(0, y, Width, row);
+                y += row;
+            }
+            y += gap + (row - field) / 2;
+            hex.SetBounds(Width - number, y, number, field);
+            swatch = new Rectangle(0, y, Math.Max(0, Width - number - gap), field);
+        }
+
+        protected override void PaintContent(Graphics g)
+        {
+            using (GraphicsPath path = Icons.RoundedRect(swatch, Height / 60f + 3))
+            using (var brush = new SolidBrush(color))
+            using (var pen = new Pen(Palette.Separator))
+            {
+                g.FillPath(brush, path);
+                g.DrawPath(pen, path);
+            }
+        }
+    }
+
+    // Borderless popup with rounded corners that closes when it loses focus or on Esc, like Windows 11
+    // flyouts. Its background is solid, so ordinary controls (TextField, NumberBox...) work anywhere on it.
+    // Lay out its content from the font (see Metrics); it isn't display-scaled automatically.
+    public class Flyout : FluentForm
+    {
+        public Flyout()
+        {
+            Backdrop = Backdrop.None;
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            int round = NativeMethods.DWMWCP_ROUND;
+            NativeMethods.DwmSetWindowAttribute(Handle, NativeMethods.DWMWA_WINDOW_CORNER_PREFERENCE, ref round, 4);
+        }
+
+        // Keeps the owner looking active (title bar and backdrop) while the flyout has focus, as menus do,
+        // so changes to the owner can be previewed as it normally looks
+        protected override void OnActivated(EventArgs e)
+        {
+            base.OnActivated(e);
+            if (Owner != null) NativeMethods.SendMessage(Owner.Handle, NativeMethods.WM_NCACTIVATE, (IntPtr)1, IntPtr.Zero);
+        }
+
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            Form owner = Owner;
+            Close();
+            if (owner == null || owner.IsDisposed) return;
+            // Once activation settles: if focus went to another app rather than the owner, the owner
+            // should look inactive again
+            owner.BeginInvoke((MethodInvoker)delegate
+            {
+                if (!owner.IsDisposed && Form.ActiveForm != owner)
+                    NativeMethods.SendMessage(owner.Handle, NativeMethods.WM_NCACTIVATE, IntPtr.Zero, IntPtr.Zero);
+            });
+        }
+
+        protected override bool ProcessDialogKey(Keys keyData)
+        {
+            if (keyData == Keys.Escape)
+            {
+                Close();
+                return true;
+            }
+            return base.ProcessDialogKey(keyData);
+        }
+
+        // Shows the flyout below anchor (above it if there's no room), lined up with its left edge
+        public void ShowNear(Control anchor)
+        {
+            Rectangle bounds = anchor.RectangleToScreen(anchor.ClientRectangle);
+            Rectangle area = Screen.FromRectangle(bounds).WorkingArea;
+            int gap = Math.Max(2, bounds.Height / 8);
+            int x = Math.Max(area.Left, Math.Min(bounds.Left, area.Right - Width));
+            int y = bounds.Bottom + gap;
+            if (y + Height > area.Bottom) y = Math.Max(area.Top, bounds.Top - gap - Height);
+            Location = new Point(x, y);
+            Show(anchor.FindForm());
+        }
+    }
+
+    // Flyout that edits a FluentForm's backdrop tint (opacity and color) for its current theme, previewing
+    // live. Changed fires on every edit.
+    public class BackdropFlyout : Flyout
+    {
+        readonly FluentForm target;
+        readonly SliderField opacity = new SliderField { Minimum = 0, Maximum = 100 };
+        readonly ColorPicker picker = new ColorPicker();
+
+        public event EventHandler Changed;
+
+        public BackdropFlyout(FluentForm target)
+        {
+            this.target = target;
+            Font = target.Font;
+            ThemeMode = target.ThemeMode;
+            Palette palette = target.Palette;
+            opacity.Value = palette.TintOpacity;
+            picker.Color = palette.BackdropTint;
+
+            SuspendLayout();
+            var headingFont = new Font("Segoe UI Semibold", Font.SizeInPoints);
+            Disposed += delegate { headingFont.Dispose(); };
+            var opacityLabel = new GlassLabel { Text = "Opacity", Font = headingFont };
+            var tintLabel = new GlassLabel { Text = "Tint", Font = headingFont };
+            // Added first so they inherit the font that the layout below measures with
+            Controls.AddRange(new Control[] { opacityLabel, opacity, tintLabel, picker });
+            int pad = Font.Height, width = Font.Height * 18, y = pad;
+            opacityLabel.Location = new Point(pad, y);
+            y += opacityLabel.Height + pad / 4;
+            opacity.SetBounds(pad, y, width, Metrics.Row(Font));
+            y += opacity.Height + pad / 2;
+            tintLabel.Location = new Point(pad, y);
+            y += tintLabel.Height + pad / 4;
+            picker.SetBounds(pad, y, width, picker.PreferredHeight);
+            y += picker.Height + pad;
+            ClientSize = new Size(width + 2 * pad, y);
+            ResumeLayout();
+
+            opacity.ValueChanged += OnEdited;
+            picker.ColorChanged += OnEdited;
+        }
+
+        void OnEdited(object sender, EventArgs e)
+        {
+            Palette palette = target.Palette;
+            palette.BackdropTint = Color.FromArgb(palette.BackdropTint.A, picker.Color);
+            palette.TintOpacity = opacity.Value;
+            target.Invalidate(true);
+            if (Changed != null) Changed(this, EventArgs.Empty);
+        }
+    }
+
     // Flat key/value settings in a JSON file. Never throws: a missing, unreadable or read-only file
     // just means defaults are used and changes aren't kept.
     public class JsonSettings
@@ -947,6 +1948,15 @@ namespace FluentUI
             return values.TryGetValue(key, out value) && value is string ? (string)value : fallback;
         }
 
+        public int GetInt(string key, int fallback)
+        {
+            object value;
+            if (!values.TryGetValue(key, out value)) return fallback;
+            if (value is int) return (int)value;
+            if (value is decimal) return (int)Math.Round((decimal)value);
+            return fallback;
+        }
+
         public T GetEnum<T>(string key, T fallback) where T : struct
         {
             T result;
@@ -976,6 +1986,7 @@ namespace FluentUI
         [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
         [DllImport("dwmapi.dll")] public static extern int DwmExtendFrameIntoClientArea(IntPtr hwnd, ref Margins margins);
         [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] public static extern int SetWindowTheme(IntPtr hwnd, string appName, string idList);
+        [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
         [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
         [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr hdc);
         [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
@@ -990,6 +2001,9 @@ namespace FluentUI
 
         public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
         public const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+        public const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+        public const int DWMWCP_ROUND = 2;
+        public const int WM_NCACTIVATE = 0x0086;
         public const int SRCCOPY = 0x00CC0020;
     }
 }

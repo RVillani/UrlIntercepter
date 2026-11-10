@@ -10,6 +10,7 @@ Clicking a link in another app (Discord, email, a PDF…) normally loads the pag
 - `?`, `&` and `#` get their own colors, so query parameters and the anchor stand out
 - Icon buttons (hover for their names), grouped left to right:
   - **Theme**: cycles System → Light → Dark. The choice is saved in `UrlIntercepter.json` next to the exe
+  - **Backdrop** (palette): a flyout with the acrylic tint's opacity and color (RGB or HSV sliders, or a hex value), previewed live and saved separately for the light and dark themes. Windows draws the title bar, so it stays untinted
   - **Remove parameters** (`?`) deletes the query string, from the `?` up to the `#` (the anchor is kept); **Remove anchor** (`#`) deletes everything from the `#`
   - **Undo** / **Redo** (Ctrl+Z, Ctrl+Y)
   - **Copy link**, **Cancel** (Esc), **Open** in the browser (Enter)
