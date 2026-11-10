@@ -1,0 +1,5 @@
+# Built by Install.cmd
+*.exe
+
+# Superseded design notes (see CLAUDE.md)
+Claude outputs/
