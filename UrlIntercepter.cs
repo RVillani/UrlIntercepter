@@ -403,19 +403,22 @@ class LinkDialog : FluentForm
         flyout.ShowNear(backdropButton);
     }
 
-    // Stored per theme as e.g. "darkTint": "#202020" and "darkTintOpacity": 30 (percent)
+    // Stored per theme as e.g. "darkTint": "#202020", "darkTintOpacity": 30 (percent) and
+    // "darkTintBlend": "Overlay"
     void LoadTint(Palette palette, string theme)
     {
         Color color;
         if (ColorPicker.TryParseHex(settings.GetString(theme + "Tint", null), out color))
             palette.BackdropTint = Color.FromArgb(palette.BackdropTint.A, color);
         palette.TintOpacity = settings.GetInt(theme + "TintOpacity", palette.TintOpacity);
+        palette.TintBlend = settings.GetEnum(theme + "TintBlend", TintBlend.Overlay);
     }
 
     void SaveTint(Palette palette, string theme)
     {
         settings.Set(theme + "Tint", ColorPicker.ToHex(palette.BackdropTint));
         settings.Set(theme + "TintOpacity", palette.TintOpacity);
+        settings.Set(theme + "TintBlend", palette.TintBlend);
     }
 
     // Copies the link without closing the window; the icon briefly turns into a check mark

@@ -11,7 +11,9 @@
 //   - Everywhere else, use GlassControl subclasses (GlassLabel, IconButton, ButtonBar), which draw with alpha.
 // On Windows versions without system backdrops, everything falls back to a solid themed background.
 // The system backdrop can't be tinted, so the form and its GlassControls paint Palette.BackdropTint (a
-// translucent color) over it instead; the title bar, drawn by Windows, stays untinted.
+// translucent color) over it instead; the title bar, drawn by Windows, stays untinted. Blend modes other
+// than Normal are approximated: the window can only alpha-blend over the backdrop, so the tint is blended
+// with Palette.BackdropBase (the backdrop's typical color) and the result painted at the tint's opacity.
 //
 // Controls with text input (TextField, NumberBox, SliderField, ColorPicker) contain TextBoxes, so they
 // belong on opaque forms such as a Flyout.
@@ -36,6 +38,9 @@ namespace FluentUI
 
     public enum ButtonTone { Neutral, Danger }
 
+    // How Palette.BackdropTint mixes with the backdrop (as in image editors)
+    public enum TintBlend { Normal, Overlay }
+
     // Colors of one theme. Fields are writable, so an app can restyle Palette.Light/Palette.Dark before
     // creating its forms (e.g. Palette.Dark.Danger = Color.Orange).
     public class Palette
@@ -50,12 +55,36 @@ namespace FluentUI
         public Color Danger;       // icon color of ButtonTone.Danger buttons; their hover fill is a faint version of it
         public Color Separator;    // lines between ButtonBar groups
         public Color BackdropTint; // painted over the backdrop; its alpha is the tint's opacity (0 = none)
+        public TintBlend TintBlend;
+        public Color BackdropBase; // roughly what the system backdrop looks like, for blend modes other than Normal
 
         // BackdropTint's opacity as a percentage
         public int TintOpacity
         {
             get { return (int)Math.Round(BackdropTint.A * 100 / 255.0); }
             set { BackdropTint = Color.FromArgb((int)Math.Round(Math.Max(0, Math.Min(100, value)) * 255 / 100.0), BackdropTint); }
+        }
+
+        // The color actually painted over the backdrop: BackdropTint blended with BackdropBase, at
+        // BackdropTint's opacity
+        public Color GlassTint
+        {
+            get
+            {
+                if (TintBlend == TintBlend.Normal) return BackdropTint;
+                return Color.FromArgb(BackdropTint.A,
+                    Overlay(BackdropBase.R, BackdropTint.R),
+                    Overlay(BackdropBase.G, BackdropTint.G),
+                    Overlay(BackdropBase.B, BackdropTint.B));
+            }
+        }
+
+        // Darkens dark backgrounds and lightens light ones by the blend color, keeping their contrast
+        static int Overlay(int background, int blend)
+        {
+            double b = background / 255.0, t = blend / 255.0;
+            double result = b <= 0.5 ? 2 * b * t : 1 - 2 * (1 - b) * (1 - t);
+            return (int)Math.Round(result * 255);
         }
 
         public static readonly Palette Light = new Palette
@@ -70,6 +99,7 @@ namespace FluentUI
             Danger = Color.FromArgb(196, 43, 28),
             Separator = Color.FromArgb(40, 0, 0, 0),
             BackdropTint = Color.FromArgb(0, 243, 243, 243),
+            BackdropBase = Color.FromArgb(220, 220, 220),
         };
 
         public static readonly Palette Dark = new Palette
@@ -84,6 +114,7 @@ namespace FluentUI
             Danger = Color.FromArgb(255, 120, 130),
             Separator = Color.FromArgb(45, 255, 255, 255),
             BackdropTint = Color.FromArgb(0, 32, 32, 32),
+            BackdropBase = Color.FromArgb(44, 44, 44),
         };
     }
 
@@ -201,7 +232,7 @@ namespace FluentUI
         // What the form and its GlassControls fill their background with
         public Color GlassFill
         {
-            get { return BackdropActive ? Palette.BackdropTint : Palette.Background; }
+            get { return BackdropActive ? Palette.GlassTint : Palette.Background; }
         }
 
         // Shared by the form's controls (IconButton.ToolTipText uses it)
@@ -1870,6 +1901,7 @@ namespace FluentUI
     {
         readonly FluentForm target;
         readonly SliderField opacity = new SliderField { Minimum = 0, Maximum = 100 };
+        readonly TabStrip blend = new TabStrip();
         readonly ColorPicker picker = new ColorPicker();
 
         public event EventHandler Changed;
@@ -1882,19 +1914,26 @@ namespace FluentUI
             Palette palette = target.Palette;
             opacity.Value = palette.TintOpacity;
             picker.Color = palette.BackdropTint;
+            blend.SetItems(Enum.GetNames(typeof(TintBlend)));
+            blend.SelectedIndex = (int)palette.TintBlend;
 
             SuspendLayout();
             var headingFont = new Font("Segoe UI Semibold", Font.SizeInPoints);
             Disposed += delegate { headingFont.Dispose(); };
             var opacityLabel = new GlassLabel { Text = "Opacity", Font = headingFont };
+            var blendLabel = new GlassLabel { Text = "Blend", Font = headingFont };
             var tintLabel = new GlassLabel { Text = "Tint", Font = headingFont };
             // Added first so they inherit the font that the layout below measures with
-            Controls.AddRange(new Control[] { opacityLabel, opacity, tintLabel, picker });
+            Controls.AddRange(new Control[] { opacityLabel, opacity, blendLabel, blend, tintLabel, picker });
             int pad = Font.Height, width = Font.Height * 18, y = pad;
             opacityLabel.Location = new Point(pad, y);
             y += opacityLabel.Height + pad / 4;
             opacity.SetBounds(pad, y, width, Metrics.Row(Font));
             y += opacity.Height + pad / 2;
+            blendLabel.Location = new Point(pad, y);
+            y += blendLabel.Height + pad / 4;
+            blend.SetBounds(pad, y, width, Metrics.Row(Font));
+            y += blend.Height + pad / 2;
             tintLabel.Location = new Point(pad, y);
             y += tintLabel.Height + pad / 4;
             picker.SetBounds(pad, y, width, picker.PreferredHeight);
@@ -1903,6 +1942,7 @@ namespace FluentUI
             ResumeLayout();
 
             opacity.ValueChanged += OnEdited;
+            blend.SelectedIndexChanged += OnEdited;
             picker.ColorChanged += OnEdited;
         }
 
@@ -1911,6 +1951,7 @@ namespace FluentUI
             Palette palette = target.Palette;
             palette.BackdropTint = Color.FromArgb(palette.BackdropTint.A, picker.Color);
             palette.TintOpacity = opacity.Value;
+            palette.TintBlend = (TintBlend)blend.SelectedIndex;
             target.Invalidate(true);
             if (Changed != null) Changed(this, EventArgs.Empty);
         }
