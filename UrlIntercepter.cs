@@ -20,8 +20,133 @@ static class Native
     [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmdShow);
 
+    [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(int access, bool inheritHandle, int processId);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")] public static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool QueryFullProcessImageName(IntPtr process, int flags, System.Text.StringBuilder name, ref int size);
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryInformationProcess(IntPtr process, int infoClass, ref PROCESS_BASIC_INFORMATION info, int size, out int returnLength);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    public static extern int ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, int count);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_BASIC_INFORMATION
+    {
+        public IntPtr ExitStatus, PebBaseAddress, AffinityMask, BasePriority, UniqueProcessId, InheritedFromUniqueProcessId;
+    }
+
     public const int WM_SETREDRAW = 0x000B;
+    public const int WM_SETICON = 0x0080;
+    public const int ICON_SMALL = 0;
     public const int SW_SHOWNORMAL = 1;
+    public const int PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+}
+
+// The app that opened the link. Windows doesn't tell a link handler who called it, but apps open links
+// with ShellExecute, which starts the handler from inside their own process, so it's our parent process.
+class LaunchingApp
+{
+    public string Name;     // e.g. "Discord", from the exe's file description
+    public string ExeName;  // e.g. "Discord.exe"
+    public Icon LargeIcon, SmallIcon;  // null when the exe has none
+
+    // Helpers that only pass a link on (cmd /c start, rundll32 url.dll, a WebView2 child process);
+    // the app is further up the chain
+    static readonly string[] PassThrough = { "cmd.exe", "powershell.exe", "pwsh.exe", "rundll32.exe", "msedgewebview2.exe" };
+
+    public string Title
+    {
+        get
+        {
+            // No "olk (olk.exe)" when the exe has no description
+            bool sameName = string.Equals(Name, Path.GetFileNameWithoutExtension(ExeName), StringComparison.OrdinalIgnoreCase);
+            return (sameName ? ExeName : Name + " (" + ExeName + ")") + " launched a link";
+        }
+    }
+
+    // Null when the parent can't be identified (it already exited, or access is denied)
+    public static LaunchingApp Find()
+    {
+        string path = null;
+        IntPtr self = Native.GetCurrentProcess();  // pseudo handle; needs no closing
+        IntPtr child = self;
+        try
+        {
+            long childStart = StartTime(child);
+            for (int depth = 0; depth < 8; depth++)
+            {
+                int parentId = ParentId(child);
+                if (parentId <= 4) break;  // 0 = none, 4 = System
+                IntPtr parent = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, parentId);
+                if (parent == IntPtr.Zero) break;
+                long start = StartTime(parent);
+                string parentPath = ImagePath(parent);
+                // Started after the child: the real parent exited and its ID was reused
+                if (start == 0 || start > childStart || parentPath == null)
+                {
+                    Native.CloseHandle(parent);
+                    break;
+                }
+                if (child != self) Native.CloseHandle(child);
+                child = parent;
+                childStart = start;
+                path = parentPath;
+                if (Array.IndexOf(PassThrough, Path.GetFileName(path).ToLowerInvariant()) < 0) break;
+            }
+        }
+        catch (Exception)
+        {
+            // Naming the caller is a nicety; never let it stop the link
+        }
+        finally
+        {
+            if (child != self) Native.CloseHandle(child);
+        }
+        if (path == null) return null;
+
+        var app = new LaunchingApp { ExeName = Path.GetFileName(path) };
+        try
+        {
+            FileVersionInfo version = FileVersionInfo.GetVersionInfo(path);
+            app.Name = !string.IsNullOrWhiteSpace(version.FileDescription) ? version.FileDescription.Trim()
+                : !string.IsNullOrWhiteSpace(version.ProductName) ? version.ProductName.Trim() : null;
+        }
+        catch (Exception) { }
+        if (app.Name == null) app.Name = Path.GetFileNameWithoutExtension(path);
+
+        // System-sized large (taskbar, Alt+Tab) and small (title bar) icons, each drawn at its own size
+        var large = new IntPtr[1];
+        var small = new IntPtr[1];
+        if (Native.ExtractIconEx(path, 0, large, small, 1) > 0)
+        {
+            if (large[0] != IntPtr.Zero) app.LargeIcon = Icon.FromHandle(large[0]);
+            if (small[0] != IntPtr.Zero) app.SmallIcon = Icon.FromHandle(small[0]);
+        }
+        return app;
+    }
+
+    static int ParentId(IntPtr process)
+    {
+        var info = new Native.PROCESS_BASIC_INFORMATION();
+        int length;
+        if (Native.NtQueryInformationProcess(process, 0, ref info, Marshal.SizeOf(info), out length) != 0) return 0;
+        return info.InheritedFromUniqueProcessId.ToInt32();
+    }
+
+    static long StartTime(IntPtr process)
+    {
+        long creation, exit, kernel, user;
+        return Native.GetProcessTimes(process, out creation, out exit, out kernel, out user) ? creation : 0;
+    }
+
+    static string ImagePath(IntPtr process)
+    {
+        var name = new System.Text.StringBuilder(1024);
+        int size = name.Capacity;
+        return Native.QueryFullProcessImageName(process, 0, name, ref size) ? name.ToString() : null;
+    }
 }
 
 static class Program
@@ -38,7 +163,7 @@ static class Program
         Application.SetCompatibleTextRenderingDefault(false);
 
         string edited;
-        using (var dialog = new LinkDialog(args.Length > 0 ? args[0] : ""))
+        using (var dialog = new LinkDialog(args.Length > 0 ? args[0] : "", LaunchingApp.Find()))
         {
             if (dialog.ShowDialog() != DialogResult.OK) return;
             edited = dialog.Link;
@@ -125,20 +250,25 @@ class LinkDialog : FluentForm
         get { return Regex.Replace(textBox.Text, "[\r\n]", "").Trim(); }
     }
 
-    public LinkDialog(string url)
+    readonly LaunchingApp launcher;
+
+    public LinkDialog(string url, LaunchingApp launcher)
     {
+        this.launcher = launcher;
         SuspendLayout();
         // Sizes below are in 96-DPI pixels; WinForms scales them to the display's scaling factor
         AutoScaleDimensions = new SizeF(96, 96);
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 9);
-        Text = "Open link";
+        Text = launcher != null ? launcher.Title : "Open link";
         ClientSize = new Size(720, 200);
         // The width is raised to fit the button bar in OnLoad
         MinimumSize = new Size(200, 180);
         StartPosition = FormStartPosition.CenterScreen;
         TopMost = true;
-        ShowIcon = false;
+        // The launching app's icon in the title bar and on the taskbar button
+        ShowIcon = launcher != null && launcher.LargeIcon != null;
+        if (ShowIcon) Icon = launcher.LargeIcon;
         MinimizeBox = false;
 
         var label = new GlassLabel
@@ -255,6 +385,10 @@ class LinkDialog : FluentForm
         base.OnLoad(e);
         // Sizes are display-scaled by now; keep every button visible
         MinimumSize = new Size(buttonBar.MinimumWidth + Width - buttonBar.Width, MinimumSize.Height);
+        // Form.Icon shrinks the large icon for the title bar; the exe's own small icon is sharper.
+        // Sent here because the form sets its icons after OnHandleCreated.
+        if (ShowIcon && launcher.SmallIcon != null)
+            Native.SendMessage(Handle, Native.WM_SETICON, (IntPtr)Native.ICON_SMALL, launcher.SmallIcon.Handle);
     }
 
     protected override void OnShown(EventArgs e)
