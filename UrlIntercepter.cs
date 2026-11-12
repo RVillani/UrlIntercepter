@@ -110,7 +110,7 @@ class LinkDialog : FluentForm
     readonly Timer copyTimer = new Timer { Interval = 1500 };
     readonly Font monoFont;
     readonly JsonSettings settings = JsonSettings.NextToExecutable();
-    Color letterColor, digitColor, symbolColor, queryColor, ampersandColor, anchorColor;
+    Color letterColor, digitColor, symbolColor, queryBack, valueBack, anchorBack;
 
     // Recoloring changes the selection, which must not be recorded as an edit
     bool busy;
@@ -228,18 +228,18 @@ class LinkDialog : FluentForm
             letterColor = Color.FromArgb(240, 240, 240);
             digitColor = Color.FromArgb(255, 184, 108);
             symbolColor = Color.FromArgb(110, 180, 255);
-            queryColor = Color.FromArgb(255, 110, 210);
-            ampersandColor = Color.FromArgb(90, 230, 120);
-            anchorColor = Color.FromArgb(255, 80, 80);
+            queryBack = Mix(Palette.Surface, Color.FromArgb(190, 110, 255), 0.18);
+            valueBack = Mix(Palette.Surface, Color.FromArgb(190, 110, 255), 0.40);
+            anchorBack = Mix(Palette.Surface, Color.FromArgb(70, 210, 120), 0.28);
         }
         else
         {
             letterColor = Color.FromArgb(30, 30, 30);
             digitColor = Color.FromArgb(176, 82, 0);
             symbolColor = Color.FromArgb(0, 92, 197);
-            queryColor = Color.FromArgb(200, 0, 160);
-            ampersandColor = Color.FromArgb(0, 135, 60);
-            anchorColor = Color.FromArgb(210, 0, 0);
+            queryBack = Mix(Palette.Surface, Color.FromArgb(150, 70, 230), 0.10);
+            valueBack = Mix(Palette.Surface, Color.FromArgb(150, 70, 230), 0.25);
+            anchorBack = Mix(Palette.Surface, Color.FromArgb(30, 170, 80), 0.18);
         }
         textBox.BackColor = Palette.Surface;
         textBox.ForeColor = Palette.Text;
@@ -295,12 +295,27 @@ class LinkDialog : FluentForm
             textBox.Select(m.Index, m.Length);
             textBox.SelectionColor = symbolColor;
         }
-        // ? starts the query, & separates parameters and # starts the anchor; their own colors
-        // make each part easy to spot
-        foreach (Match m in Regex.Matches(textBox.Text, "[?&#]"))
+        // Background highlights so the parts can be skimmed: the query (from ? up to #) gets a
+        // light tint, each parameter's value a stronger one, and the anchor (from #) its own tint
+        string text = textBox.Text;
+        int hash = text.IndexOf('#');
+        int queryEnd = hash >= 0 ? hash : text.Length;
+        int query = QueryStart(text);
+        if (query >= 0)
         {
-            textBox.Select(m.Index, m.Length);
-            textBox.SelectionColor = m.Value == "?" ? queryColor : m.Value == "&" ? ampersandColor : anchorColor;
+            textBox.Select(query, queryEnd - query);
+            textBox.SelectionBackColor = queryBack;
+            // Parameters are separated by & (or ;); a value runs from its first = to the separator
+            foreach (Match m in Regex.Matches(text.Substring(query + 1, queryEnd - query - 1), "=([^&;]+)"))
+            {
+                textBox.Select(query + 1 + m.Groups[1].Index, m.Groups[1].Length);
+                textBox.SelectionBackColor = valueBack;
+            }
+        }
+        if (hash >= 0)
+        {
+            textBox.Select(hash, text.Length - hash);
+            textBox.SelectionBackColor = anchorBack;
         }
 
         textBox.Select(start, length);
@@ -313,6 +328,15 @@ class LinkDialog : FluentForm
         removeAnchor.Enabled = textBox.Text.Contains("#");
         undo.Enabled = history.Count > 1;
         redo.Enabled = redoHistory.Count > 0;
+    }
+
+    // Blend a tint into a background color; amount 0 is the background, 1 the tint
+    static Color Mix(Color background, Color tint, double amount)
+    {
+        return Color.FromArgb(
+            (int)Math.Round(background.R + (tint.R - background.R) * amount),
+            (int)Math.Round(background.G + (tint.G - background.G) * amount),
+            (int)Math.Round(background.B + (tint.B - background.B) * amount));
     }
 
     // A ? only starts the query when it comes before the anchor's #
